@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>학회 AI 세션 아카이브 (PapaParse + AlaSQL + Grid.js)</title>
+
+  <!-- 1. Grid.js CSS -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridjs/dist/theme/mermaid.min.css" />
+
+  <!-- 2. CDN 라이브러리 로드 -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/alasql@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/gridjs/dist/gridjs.umd.js"></script>
+
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Pretendard", "Segoe UI", Roboto, sans-serif;
+      padding: 24px;
+      background-color: #f8fafc;
+      color: #1e293b;
+      margin: 0;
+    }
+    .container {
+      max-width: 1400px; /* 컬럼이 많아 넓게 조정 */
+      margin: 0 auto;
+      background: #fff;
+      padding: 24px;
+      border-radius: 10px;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.07);
+    }
+    h2 { 
+      margin-top: 0; 
+      margin-bottom: 12px;
+      color: #0f172a;
+    }
+    .meta-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 16px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #e2e8f0;
+      font-size: 14px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 8px;
+      font-size: 12px;
+      font-weight: 600;
+      background: #e2e8f0;
+      color: #475569;
+      border-radius: 4px;
+    }
+    /* 관련도 배지 커스텀 스타일 */
+    .badge-direct { background: #dcfce7; color: #166534; }
+    .badge-applied { background: #dbeafe; color: #1e40af; }
+
+    /* SQL 컨트롤 영역 */
+    .control-panel {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 16px;
+      background: #f1f5f9;
+      padding: 12px;
+      border-radius: 8px;
+      align-items: center;
+    }
+    .control-panel select, .control-panel input {
+      padding: 8px 12px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    .control-panel input {
+      flex: 1;
+      min-width: 280px;
+      font-family: monospace;
+    }
+    .control-panel button {
+      padding: 8px 16px;
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .control-panel button:hover { background: #1d4ed8; }
+
+    /* Grid.js 테이블 폰트 및 줄바꿈 최적화 */
+    .gridjs-table { font-size: 13px; }
+    .gridjs-td { 
+      white-space: normal !important; 
+      line-height: 1.45;
+      vertical-align: middle;
+    }
+    .link-btn {
+      display: inline-block;
+      padding: 4px 8px;
+      background: #f1f5f9;
+      color: #2563eb;
+      text-decoration: none;
+      border-radius: 4px;
+      font-weight: 600;
+      font-size: 12px;
+    }
+    .link-btn:hover { background: #e2e8f0; }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <h2>학회 AI 세션 데이터베이스</h2>
+    
+    <div class="meta-bar">
+      <div><span class="badge">CSV</span> <code id="csv-path-display">./db/sessions.csv</code></div>
+      <div><span class="badge">총 데이터</span> <strong id="row-count">0</strong>건</div>
+    </div>
+
+    <!-- 동적 SQL 필터 테스트 영역 -->
+    <div class="control-panel">
+      <label for="rel-filter" style="font-size: 13px; font-weight: 600;">빠른 필터:</label>
+      <select id="rel-filter">
+        <option value="ALL">전체 관련도 보기</option>
+        <option value="직접">관련도: 직접 (Direct)</option>
+        <option value="응용">관련도: 응용 (Applied)</option>
+      </select>
+
+      <input type="text" id="sql-input" value="SELECT * FROM ? ORDER BY session ASC" />
+      <button id="run-sql-btn">SQL 실행</button>
+    </div>
+
+    <!-- Grid.js 테이블이 렌더링될 DOM 컨테이너 -->
+    <div id="table-wrapper"></div>
+  </div>
+
+  <script>
+    // 불러올 CSV 파일 경로 (GitHub Pages 환경에 맞게 수정해줘)
+    const CSV_PATH = './db/sessions.csv';
+    document.getElementById('csv-path-display').textContent = CSV_PATH;
+
+    let globalRawData = []; // 파싱된 CSV 원본 데이터 보관
+    let gridInstance = null; // Grid.js 인스턴스 보관
+
+    // 1. PapaParse를 Promise로 감싸서 비동기 처리
+    function parseCsvFile(url) {
+      return new Promise((resolve, reject) => {
+        Papa.parse(url, {
+          download: true,
+          header: true,
+          dynamicTyping: true,
+          skipEmptyLines: true,
+          complete: (results) => resolve(results.data),
+          error: (error) => reject(error)
+        });
+      });
+    }
+
+    // 2. AlaSQL 쿼리 실행 및 Grid.js 업데이트 함수
+    function runQueryAndRender(sqlQuery) {
+      const wrapper = document.getElementById('table-wrapper');
+      
+      try {
+        const filteredData = alasql(sqlQuery, [globalRawData]);
+        document.getElementById('row-count').textContent = filteredData.length;
+
+        // Grid.js 컬럼 정의 (CSV 헤더 Key와 매핑)
+        const columns = [
+          { id: 'society', name: '학회', width: '110px' },
+          { id: 'year', name: '연도', width: '75px' },
+          { id: 'session', name: '세션명', width: '180px' },
+          { id: 'title', name: '발표 제목', width: '240px' },
+          { id: 'presenter', name: '발표자', width: '130px' },
+          { 
+            id: 'relevance', 
+            name: '관련도', 
+            width: '85px',
+            formatter: (cell) => {
+              const badgeClass = cell === '직접' ? 'badge-direct' : 'badge-applied';
+              return gridjs.html(`<span class="badge ${badgeClass}">${cell || '-'}</span>`);
+            }
+          },
+          { id: 'field', name: '분야', width: '115px' },
+          { id: 'stage', name: '단계', width: '95px' },
+          { id: 'summary', name: '핵심 요약', width: '250px' },
+          { id: 'ai_reason', name: 'AI 분류 근거', width: '180px' },
+          { 
+            id: 'source_url', 
+            name: '출처', 
+            width: '80px',
+            formatter: (cell) => cell 
+              ? gridjs.html(`<a href="${cell}" target="_blank" rel="noopener" class="link-btn">링크 🔗</a>`) 
+              : '-'
+          }
+        ];
+
+        // 최초 실행 시 Grid 생성, 이후에는 데이터만 업데이트
+        if (!gridInstance) {
+          gridInstance = new gridjs.Grid({
+            columns: columns,
+            data: filteredData,
+            search: true,
+            sort: true,
+            resizable: true, // 컬럼 너비 마우스 조절 가능
+            pagination: {
+              limit: 10
+            },
+            language: {
+              search: { placeholder: '키워드 검색 (제목, 발표자, 요약 등)...' },
+              pagination: {
+                previous: '이전',
+                next: '다음',
+                showing: '표시 중:',
+                results: () => '건'
+              },
+              noRecordsFound: '조건에 일치하는 세션 데이터가 없어.'
+            }
+          }).render(wrapper);
+        } else {
+          gridInstance.updateConfig({
+            data: filteredData
+          }).forceRender();
+        }
+
+      } catch (sqlErr) {
+        alert("SQL 쿼리 오류가 발생했어: " + sqlErr.message);
+      }
+    }
+
+    // 3. 초기화 함수
+    async function init() {
+      const wrapper = document.getElementById('table-wrapper');
+      const sqlInput = document.getElementById('sql-input');
+      const relFilter = document.getElementById('rel-filter');
+
+      try {
+        // Step 1: CSV 파싱
+        globalRawData = await parseCsvFile(CSV_PATH);
+        console.log("파싱된 원본 데이터:", globalRawData);
+
+        // Step 2: 초기 SQL 실행 및 렌더링
+        runQueryAndRender(sqlInput.value);
+
+        // 이벤트 리스너 1: 드롭다운 변경 시 SQL 자동 변경 및 실행
+        relFilter.addEventListener('change', (e) => {
+          const val = e.target.value;
+          if (val === 'ALL') {
+            sqlInput.value = `SELECT * FROM ? ORDER BY session ASC`;
+          } else {
+            sqlInput.value = `SELECT * FROM ? WHERE relevance = '${val}' ORDER BY session ASC`;
+          }
+          runQueryAndRender(sqlInput.value);
+        });
+
+        // 이벤트 리스너 2: SQL 직접 수정 후 버튼 클릭 시 실행
+        document.getElementById('run-sql-btn').addEventListener('click', () => {
+          runQueryAndRender(sqlInput.value);
+        });
+
+        // 엔터키로도 SQL 실행 가능하도록 지원
+        sqlInput.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') runQueryAndRender(sqlInput.value);
+        });
+
+      } catch (err) {
+        console.error("데이터 로드 실패:", err);
+        wrapper.innerHTML = `
+          <div style="color: #dc2626; padding: 16px; background: #fee2e2; border-radius: 6px; line-height: 1.6;">
+            <strong>데이터를 불러오지 못했어:</strong> ${err.message || '파일 경로 또는 CORS 오류'}<br>
+            <small>
+              1. <code>${CSV_PATH}</code> 경로에 실제 CSV 파일이 있는지 확인해줘.<br>
+              2. 로컬에서 테스트할 때는 VS Code Live Server나 <code>python -m http.server</code> 같은 로컬 웹 서버로 열어야 정상 작동해!
+            </small>
+          </div>
+        `;
+      }
+    }
+
+    // 실행
+    init();
+  </script>
+</body>
+</html>
